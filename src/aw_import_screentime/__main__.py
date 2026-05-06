@@ -70,6 +70,16 @@ logger = logging.getLogger("aw_import_screentime")
 APPLE_EPOCH_OFFSET = 978307200  # CFAbsoluteTime offset to Unix epoch (s)
 UTC = timezone.utc
 
+# Bundle IDs that represent the device being idle rather than actively used.
+# Events from these apps are written as "afk" to the companion AFk bucket and
+# are excluded from the window bucket, so AW's Activity view treats them as
+# away time and doesn't count them toward app usage.
+AFK_BUNDLE_IDS: frozenset[str] = frozenset(
+    {
+        "com.apple.springboard.stand-by",  # Lock screen / StandBy mode
+    }
+)
+
 # --------------------------------------------------------------------------------------
 # Output helpers
 # --------------------------------------------------------------------------------------
@@ -169,49 +179,176 @@ class ActivityWatchSink:
         client: ActivityWatchClient,
         *,
         bucket_suffix: Optional[str] = None,
+        reimport: bool = False,
     ) -> None:
         """
         Sink that writes events to an ActivityWatch server.
 
+        Buckets are named to match the aw-watcher-window / aw-watcher-afk
+        conventions so that ActivityWatch's built-in Activity view picks them
+        up automatically when the user selects the iOS hostname.
+
         Args:
             client: Initialized ActivityWatchClient.
             bucket_suffix: Optional suffix to append to bucket ids.
+            reimport: When True, delete and recreate buckets before importing
+                so the run starts from a clean slate (Option B).  When False
+                (default), existing events are preserved and only new
+                timestamps are inserted (Option A / read-before-write).
         """
         self.client = client
         self.bucket_suffix = bucket_suffix
+        self.reimport = reimport
+        # Maps window-bucket-id → afk-bucket-id, populated by ensure_bucket.
+        self._afk_buckets: dict[str, str] = {}
 
     def _bucket_id(self, device_id: str) -> str:
         hostname = f"ios-{device_id}"
-        base = f"aw-import-screentime_ios_{hostname}"
+        base = f"aw-watcher-window_{hostname}"
         return f"{base}_{self.bucket_suffix}" if self.bucket_suffix else base
 
-    def ensure_bucket(self, device_id: str) -> str:
-        bucket_id = self._bucket_id(device_id)
+    def _afk_bucket_id(self, device_id: str) -> str:
         hostname = f"ios-{device_id}"
-        self.client.client_hostname = hostname
+        base = f"aw-watcher-afk_{hostname}"
+        return f"{base}_{self.bucket_suffix}" if self.bucket_suffix else base
+
+    def _ensure_one_bucket(self, bucket_id: str, bucket_type: str, hostname: str) -> None:
+        """Create a bucket, ignoring 304/409 if it already exists."""
         try:
-            self.client.create_bucket(bucket_id, "app")
+            self.client.create_bucket(bucket_id, bucket_type)
             logger.info("Ensured bucket %s (host: %s)", bucket_id, hostname)
         except requests.RequestException as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
             if status not in (304, 409):
                 raise
             logger.debug("Bucket %s already exists (status=%s)", bucket_id, status)
+
+    def _delete_one_bucket(self, bucket_id: str) -> None:
+        """Delete a bucket, ignoring 404 if it does not exist."""
+        try:
+            self.client.delete_bucket(bucket_id, force=True)
+            logger.info("Deleted bucket %s (reimport)", bucket_id)
+        except requests.RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status != 404:
+                raise
+            logger.debug("Bucket %s did not exist, skipping delete", bucket_id)
+
+    def _existing_timestamps(
+        self, bucket_id: str, events: Sequence[Event]
+    ) -> set[datetime]:
+        """
+        Return the set of timestamps already stored in *bucket_id* that fall
+        within the time span covered by *events*.  Used for read-before-write
+        deduplication so re-imports are safe by default.
+        """
+        if not events:
+            return set()
+        span_start = min(ev.timestamp for ev in events)
+        # Add 1 s to span_end so the last event's timestamp is included
+        # (AW filters events where timestamp < end, exclusive upper bound).
+        span_end = max(ev.timestamp for ev in events) + timedelta(seconds=1)
+        existing = self.client.get_events(bucket_id, start=span_start, end=span_end)
+        return {ev.timestamp for ev in existing}
+
+    def ensure_bucket(self, device_id: str) -> str:
+        bucket_id = self._bucket_id(device_id)
+        afk_bucket_id = self._afk_bucket_id(device_id)
+        hostname = f"ios-{device_id}"
+        self.client.client_hostname = hostname
+        if self.reimport:
+            self._delete_one_bucket(bucket_id)
+            self._delete_one_bucket(afk_bucket_id)
+        self._ensure_one_bucket(bucket_id, "currentwindow", hostname)
+        self._ensure_one_bucket(afk_bucket_id, "afkstatus", hostname)
+        self._afk_buckets[bucket_id] = afk_bucket_id
         return bucket_id
 
     def emit(self, bucket: str, events: Sequence[Event]) -> int:
         """
-        Insert events into the given ActivityWatch bucket.
+        Insert events into the given ActivityWatch bucket and update the
+        companion AFk bucket so the Activity view's idle filter works.
+
+        Events whose ``app`` bundle ID is in ``AFK_BUNDLE_IDS`` (e.g.
+        StandBy / lock screen) are treated as away time: they are excluded
+        from the window bucket and written as ``"afk"`` in the AFk bucket.
+        All other events are written to the window bucket and mirrored as
+        ``"not-afk"``.
 
         Returns:
-            The number of events inserted.
+            The number of window events inserted (AFK events not counted).
         """
         if not events:
             return 0
-        # Insert all events in a single call (explicit list to avoid generator reuse).
-        self.client.insert_events(bucket, list(events))
-        logger.info("Inserted %d events into %s", len(events), bucket)
-        return len(events)
+
+        active: list[Event] = []
+        idle: list[Event] = []
+        for ev in events:
+            if ev.data.get("app") in AFK_BUNDLE_IDS:
+                idle.append(ev)
+            else:
+                active.append(ev)
+
+        if idle:
+            logger.info(
+                "Excluding %d AFK event(s) from window bucket (e.g. stand-by)",
+                len(idle),
+            )
+
+        # Window bucket: active events only, skipping already-imported timestamps.
+        new_active = active
+        if active:
+            existing_win = self._existing_timestamps(bucket, active)
+            if existing_win:
+                new_active = [ev for ev in active if ev.timestamp not in existing_win]
+                logger.info(
+                    "Skipping %d already-imported window event(s) in %s",
+                    len(active) - len(new_active),
+                    bucket,
+                )
+            if new_active:
+                self.client.insert_events(bucket, new_active)
+                logger.info("Inserted %d events into %s", len(new_active), bucket)
+
+        # AFk bucket: mirror active→not-afk, idle→afk, skipping existing timestamps.
+        afk_bucket = self._afk_buckets.get(bucket)
+        if afk_bucket:
+            active_keys = {(ev.timestamp, ev.duration) for ev in active}
+            all_mirror = [
+                Event(
+                    timestamp=ev.timestamp,
+                    duration=ev.duration,
+                    data={
+                        "status": "not-afk"
+                        if (ev.timestamp, ev.duration) in active_keys
+                        else "afk"
+                    },
+                )
+                for ev in events
+            ]
+            existing_afk = self._existing_timestamps(afk_bucket, events)
+            if existing_afk:
+                all_mirror = [
+                    ev for ev in all_mirror if ev.timestamp not in existing_afk
+                ]
+                logger.info(
+                    "Skipping %d already-imported afk mirror event(s) in %s",
+                    len(events) - len(all_mirror),
+                    afk_bucket,
+                )
+            if all_mirror:
+                new_not_afk = sum(
+                    1 for ev in all_mirror if ev.data["status"] == "not-afk"
+                )
+                self.client.insert_events(afk_bucket, all_mirror)
+                logger.info(
+                    "Inserted %d not-afk + %d afk mirror events into %s",
+                    new_not_afk,
+                    len(all_mirror) - new_not_afk,
+                    afk_bucket,
+                )
+
+        return len(new_active)
 
 
 class NullSink:
@@ -412,9 +549,11 @@ def enrich_events_with_titles(
         app = ev.data.get("app")
         if not app:
             continue
-        title = _BUNDLE_TITLE_POS.get(str(app))
-        if title:
-            ev.data["title"] = title
+        # Always set "title": resolved human name when available, otherwise
+        # fall back to the bundle ID so every event has the field.
+        # Without this, simplify_window_titles (used by the Category Builder)
+        # crashes with a TypeError trying to regex-substitute None.
+        ev.data["title"] = _BUNDLE_TITLE_POS.get(str(app)) or str(app)
 
 
 # --------------------------------------------------------------------------------------
@@ -673,6 +812,17 @@ def cmd_events_import(
         "--port",
         help="Override aw-server port (works in testing or normal modes)",
     ),
+    reimport: bool = typer.Option(
+        False,
+        "--reimport/--no-reimport",
+        help=(
+            "Delete and recreate buckets before importing so the run starts "
+            "from a clean slate.  Use when previously imported data needs to "
+            "be replaced entirely (e.g. after a bug fix).  Without this flag "
+            "the import is safe to re-run: existing timestamps are skipped and "
+            "only new events are inserted."
+        ),
+    ),
 ) -> None:
     """
     Import stitched events into ActivityWatch.
@@ -693,7 +843,7 @@ def cmd_events_import(
     except TypeError as exc:
         raise typer.BadParameter(f"ActivityWatchClient init failed: {exc}") from exc
 
-    sink = ActivityWatchSink(client, bucket_suffix=bucket_suffix)
+    sink = ActivityWatchSink(client, bucket_suffix=bucket_suffix, reimport=reimport)
 
     db_path = sync_db_path()
     all_ids = get_device_ids(db_path, platform=platform)
